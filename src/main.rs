@@ -68,12 +68,33 @@ async fn main() -> anyhow::Result<()> {
                 SwarmEvent::NewListenAddr {address, ..} => {
                     println!("Listening on {:?}", address);
                 }
+                SwarmEvent::ConnectionClosed {..} => {
+                    target_peer_id = None;
+                }
                 SwarmEvent::ConnectionEstablished {peer_id, ..} => {
                     println!("Connection established with peer {:?}", peer_id);
                     if target_peer_id.is_none() {
                         target_peer_id = Some(peer_id);
                     }
                     swarm.add_peer_address(peer_id, peer.clone());
+                }
+                SwarmEvent::Behaviour(event) => match event {
+                    request_response::Event::Message{peer, message} => match message {
+                        request_response::Message::Request{request_id, request, channel } => {
+                            println!("{peer} {:?}", request.message);
+                            if let Err(error) = swarm.behaviour_mut().messaging.send_response(channel, MessageResponse { ack: true}) {
+                                println!("Error sending response: {:?}", error);
+                            }
+                        }
+                        request_response::Message::Response{ .. } => {},
+                    },
+                    request_response::Event::OutboundFailure{peer, request_id, error} => {
+                        println!("OutboundFailure from {:?} to {:?}: {:?}", peer, request_id, error);
+                    },
+                    request_response::Event::InboundFailure{peer, request_id, error} => {
+                        println!("InboundFailure from {:?} to {:?}: {:?}", peer, request_id, error);
+                    },
+                    request_response::Event::ResponseSent{ .. } => {},
                 }
                 _ => {}
             },
