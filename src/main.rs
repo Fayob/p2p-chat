@@ -99,7 +99,7 @@ async fn main() -> anyhow::Result<()> {
     let bootstrap_peers_str = env::var("CHAT_BOOTSTRAP_PEERS").ok();
 
     let local_key = libp2p::identity::Keypair::generate_ed25519();
-    let local_peer_id = local_key.public().to_peer_id();
+    let _local_peer_id = local_key.public().to_peer_id();
 
     let mut swarm = libp2p::SwarmBuilder::with_existing_identity(local_key)
         .with_tokio()
@@ -186,12 +186,12 @@ async fn main() -> anyhow::Result<()> {
                     println!("Connection established with peer {:?}", peer_id);
                 }
                 SwarmEvent::Behaviour(event) => match event {
-                    ChatBehaviourEvent::Ping(event) => {
+                    ChatBehaviourEvent::Ping(_event) => {
                         // println!("Ping event: {:?}", event);
                     },
                     ChatBehaviourEvent::Messaging(event) => match event {
                         request_response::Event::Message { peer, message, .. } => match message {
-                            request_response::Message::Request { request_id, request, channel } => {
+                            request_response::Message::Request { request_id: _, request, channel } => {
                                 if seen_messages.insert(request.id) {
                                     println!("Received from {}: {}", peer, request.message);
                                     // Gossip to all peers except the sender
@@ -204,7 +204,7 @@ async fn main() -> anyhow::Result<()> {
                                     println!("Error sending response: {:?}", error);
                                 }
                             }
-                            request_response::Message::Response { request_id, response } => {
+                            request_response::Message::Response { request_id: _, response } => {
                                 println!("Response from {}: ACK {:?}", peer, response.ack);
                             },
                         },
@@ -226,18 +226,18 @@ async fn main() -> anyhow::Result<()> {
                                 }
                             }
                         }
-                        mdns::Event::Expired(expired_peers) => {
+                        mdns::Event::Expired(_expired_peers) => {
                              // println!("mDNS Expired peers: {:?}", expired_peers);
                         }
                     }
                     ChatBehaviourEvent::Identify(event) => match event {
-                        identify::Event::Received { connection_id, peer_id, info } => {
+                        identify::Event::Received { connection_id: _, peer_id, info } => {
                             println!("Identify: Received info from {}: {:?}", peer_id, info.agent_version);
                             for addr in info.listen_addrs {
                                 swarm.behaviour_mut().kademlia.add_address(&peer_id, addr);
                             }
                         }
-                        identify::Event::Sent { connection_id, peer_id } => {
+                        identify::Event::Sent { connection_id: _, peer_id: _ } => {
                             // println!("Identify: Sent info to {}", peer_id);
                         }
                         identify::Event::Pushed { .. } => {}
