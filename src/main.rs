@@ -5,7 +5,7 @@ use libp2p::kad::store::MemoryStore;
 use libp2p::kad::Mode;
 use libp2p::ping::Config;
 use libp2p::swarm::behaviour::toggle::Toggle;
-use libp2p::swarm::{NetworkBehaviour, SwarmEvent}; // Removed `self`
+use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
 use libp2p::multiaddr::Protocol;
 use libp2p::futures::StreamExt;
 use libp2p::{
