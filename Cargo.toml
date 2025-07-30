@@ -9,3 +9,4 @@ tokio = { version =  "1.46.1", features = ["full"] }
 libp2p = { version = "0.54.1", features = ["full"] }
 serde = { version = "1.0.217", features = ["default", "serde_derive"] }
 futures-util = "0.3.31"
+uuid = { version = "1", features = ["v4", "serde"] }

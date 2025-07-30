@@ -1,3 +1,5 @@
+use uuid::Uuid;
+use std::collections::HashSet;
 use anyhow::anyhow;
 use libp2p::kad::store::MemoryStore;
 use libp2p::kad::Mode;
@@ -28,6 +30,7 @@ use tokio::{io, select};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct MessageRequest {
+    pub id: Uuid,
     pub message: String,
 }
 
@@ -171,6 +174,7 @@ async fn main() -> anyhow::Result<()> {
 
 
     let mut stdin = BufReader::new(io::stdin()).lines();
+    let mut seen_messages = HashSet::new();
 
     loop {
         select! {
@@ -188,7 +192,14 @@ async fn main() -> anyhow::Result<()> {
                     ChatBehaviourEvent::Messaging(event) => match event {
                         request_response::Event::Message { peer, message, .. } => match message {
                             request_response::Message::Request { request_id, request, channel } => {
-                                println!("Received from {}: {}", peer, request.message);
+                                if seen_messages.insert(request.id) {
+                                    println!("Received from {}: {}", peer, request.message);
+                                    // Gossip to all peers except the sender
+                                    let peers: Vec<_> = swarm.connected_peers().copied().filter(|p| *p != peer).collect();
+                                    for other_peer in peers {
+                                        swarm.behaviour_mut().messaging.send_request(&other_peer, request.clone());
+                                    }
+                                }
                                 if let Err(error) = swarm.behaviour_mut().messaging.send_response(channel, MessageResponse { ack: true }) {
                                     println!("Error sending response: {:?}", error);
                                 }
@@ -274,7 +285,7 @@ async fn main() -> anyhow::Result<()> {
                 } else {
                     println!("Sending '{}' to {} connected peers.", line, connected_peers.len());
                     for peer_id in connected_peers {
-                        swarm.behaviour_mut().messaging.send_request(&peer_id, MessageRequest { message: line.clone() });
+                        swarm.behaviour_mut().messaging.send_request(&peer_id, MessageRequest { id: Uuid::new_v4(), message: line.clone() });
                     }
                 }
             }
