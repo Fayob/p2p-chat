@@ -1,7 +1,6 @@
-# Peer-To-Peer (P2p) Chat
+# Peer-To-Peer (P2P) Chat
 
-A simple peer-to-peer (P2P) chat application built in Rust using [libp2p](https://libp2p.io/).  
-This project demonstrates decentralized messaging, peer discovery, and message gossiping over a local network or the internet.
+A simple cli peer-to-peer (P2P) chat application built in Rust using [libp2p](https://libp2p.io/). This project demonstrates decentralized messaging, peer discovery, and message gossiping over a local network or the internet.
 
 ---
 
