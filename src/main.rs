@@ -9,16 +9,7 @@ use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
 use libp2p::multiaddr::Protocol;
 use libp2p::futures::StreamExt;
 use libp2p::{
-    identify,
-    kad,
-    noise,
-    ping,
-    request_response,
-    tcp,
-    yamux,
-    Multiaddr,
-    PeerId,
-    StreamProtocol,
+    autonat, dcutr, identify, kad, noise, ping, request_response, relay, tcp, yamux, Multiaddr, PeerId, StreamProtocol
 };
 use libp2p::mdns;
 use libp2p::request_response::json;
@@ -47,6 +38,10 @@ struct ChatBehaviour {
     mdns: Toggle<mdns::tokio::Behaviour>,
     identify: identify::Behaviour,
     kademlia: kad::Behaviour<MemoryStore>,
+    autonat: autonat::Behaviour,
+    relay_server: relay::Behaviour,
+    relay_client: relay::client::Behaviour,
+    dcutr: dcutr::Behaviour,
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -108,7 +103,8 @@ async fn main() -> anyhow::Result<()> {
             noise::Config::new,
             yamux::Config::default,
         )?
-        .with_behaviour(move |key| {
+        .with_relay_client(noise::Config::new, yamux::Config::default)?
+        .with_behaviour(move |key, relay_client| {
             let peer_id = key.public().to_peer_id();
 
             let mdns = if mdns_enabled {
@@ -140,6 +136,10 @@ async fn main() -> anyhow::Result<()> {
                     MemoryStore::new(peer_id),
                     kad_config,
                 ),
+                autonat: autonat::Behaviour::new(key.public().to_peer_id(), autonat::Config::default()),
+                relay_server: relay::Behaviour::new(key.public().to_peer_id(), relay::Config::default()),
+                relay_client,
+                dcutr: dcutr::Behaviour::new(key.public().to_peer_id()),
             })
         })?
         .with_swarm_config(|c| {
@@ -233,9 +233,17 @@ async fn main() -> anyhow::Result<()> {
                     ChatBehaviourEvent::Identify(event) => match event {
                         identify::Event::Received { connection_id: _, peer_id, info } => {
                             println!("Identify: Received info from {}: {:?}", peer_id, info.agent_version);
+                            let is_relay = info.protocols.iter().any(|protocol| *protocol == relay::HOP_PROTOCOL_NAME);
+
                             for addr in info.listen_addrs {
-                                swarm.behaviour_mut().kademlia.add_address(&peer_id, addr);
+                                swarm.behaviour_mut().kademlia.add_address(&peer_id, addr.clone());
+                                if is_relay {
+                                    let listen_addr = addr.clone().with_p2p(peer_id).unwrap().with(Protocol::P2pCircuit);
+                                    println!("Trying to listen on {:?}", listen_addr);
+                                    swarm.listen_on(listen_addr)?;
+                                }
                             }
+
                         }
                         identify::Event::Sent { connection_id: _, peer_id: _ } => {
                             // println!("Identify: Sent info to {}", peer_id);
@@ -258,6 +266,26 @@ async fn main() -> anyhow::Result<()> {
                         kad::Event::RoutablePeer { .. } => {}
                         kad::Event::PendingRoutablePeer { .. } => {}
                         kad::Event::ModeChanged { .. } => {}
+                    }
+                    ChatBehaviourEvent::Autonat(event) => match event {
+                        autonat::Event::InboundProbe(event) => {
+                            println!("Inbound probe {:?}", event)
+                        }
+                        autonat::Event::OutboundProbe(event) => {
+                            println!("Outbound probe {:?}", event)
+                        }
+                        autonat::Event::StatusChanged{old, new} => {
+                            println!("Status changed from {:?} to {:?}", old, new)
+                        }
+                    }
+                    ChatBehaviourEvent::RelayServer(event) => {
+                        println!("Relay server {:?}", event);
+                    }
+                    ChatBehaviourEvent::RelayCleint(event) => {
+                        println!("Relay server {:?}", event);
+                    }
+                    ChatBehaviourEvent::Dcutr(event) => {
+                        println!("Dcutr: {:?}", event);
                     }
                 }
                 _ => {}
