@@ -1,94 +1,30 @@
+mod message;
+mod behaviour;
+
+use crate::behaviour::{ChatBehaviour, ChatBehaviourEvent};
+use crate::message::{MessageRequest, MessageResponse};
+
 use uuid::Uuid;
 use std::collections::HashSet;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use anyhow::anyhow;
-use libp2p::kad::store::MemoryStore;
+use libp2p::swarm::{SwarmEvent};
 use libp2p::kad::Mode;
+use libp2p::kad::store::MemoryStore;
 use libp2p::ping::Config;
-use libp2p::swarm::behaviour::toggle::Toggle;
-use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
+use libp2p::{
+    autonat, dcutr, gossipsub, identify, kad, noise, ping, request_response, relay, tcp, yamux, Multiaddr, PeerId, StreamProtocol
+};
+use libp2p::gossipsub::{MessageAuthenticity, ValidationMode};
+use libp2p::request_response::json;
+use libp2p::mdns;
 use libp2p::multiaddr::Protocol;
 use libp2p::futures::StreamExt;
-use libp2p::{
-    identify,
-    kad,
-    noise,
-    ping,
-    request_response,
-    tcp,
-    yamux,
-    Multiaddr,
-    PeerId,
-    StreamProtocol,
-};
-use libp2p::mdns;
-use libp2p::request_response::json;
-use serde::{Deserialize, Serialize};
+use libp2p::swarm::behaviour::toggle::Toggle;
 use std::env;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::{io, select};
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct MessageRequest {
-    pub id: Uuid,
-    pub message: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct MessageResponse {
-    pub ack: bool,
-}
-
-#[derive(NetworkBehaviour)]
-#[behaviour(out_event = "ChatBehaviourEvent")]
-struct ChatBehaviour {
-    ping: ping::Behaviour,
-    messaging: json::Behaviour<MessageRequest, MessageResponse>,
-    mdns: Toggle<mdns::tokio::Behaviour>,
-    identify: identify::Behaviour,
-    kademlia: kad::Behaviour<MemoryStore>,
-}
-
-#[allow(clippy::large_enum_variant)]
-#[derive(Debug)]
-enum ChatBehaviourEvent {
-    Ping(ping::Event),
-    Messaging(request_response::Event<MessageRequest, MessageResponse>),
-    Mdns(mdns::Event),
-    Identify(identify::Event),
-    Kademlia(kad::Event),
-}
-
-impl From<ping::Event> for ChatBehaviourEvent {
-    fn from(event: ping::Event) -> Self {
-        ChatBehaviourEvent::Ping(event)
-    }
-}
-
-impl From<request_response::Event<MessageRequest, MessageResponse>> for ChatBehaviourEvent {
-    fn from(event: request_response::Event<MessageRequest, MessageResponse>) -> Self {
-        ChatBehaviourEvent::Messaging(event)
-    }
-}
-
-impl From<mdns::Event> for ChatBehaviourEvent {
-    fn from(event: mdns::Event) -> Self {
-        ChatBehaviourEvent::Mdns(event)
-    }
-}
-
-impl From<identify::Event> for ChatBehaviourEvent {
-    fn from(event: identify::Event) -> Self {
-        ChatBehaviourEvent::Identify(event)
-    }
-}
-
-impl From<kad::Event> for ChatBehaviourEvent {
-    fn from(event: kad::Event) -> Self {
-        ChatBehaviourEvent::Kademlia(event)
-    }
-}
-
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -108,11 +44,13 @@ async fn main() -> anyhow::Result<()> {
             noise::Config::new,
             yamux::Config::default,
         )?
-        .with_behaviour(move |key| {
+        .with_relay_client(noise::Config::new, yamux::Config::default)?
+        .with_behaviour(move |key, relay_client| {
             let peer_id = key.public().to_peer_id();
 
             let mdns = if mdns_enabled {
-                Toggle::from(Some(mdns::tokio::Behaviour::new(mdns::Config::default(), peer_id)?))
+                Toggle::from(Some(mdns::tokio::Behaviour::new(mdns::Config::default(), peer_id)
+                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?))
             } else {
                 Toggle::from(None)
             };
@@ -120,6 +58,26 @@ async fn main() -> anyhow::Result<()> {
             let mut kad_config = kad::Config::new(StreamProtocol::new("/p2p-chat/1"));
             kad_config.set_periodic_bootstrap_interval(Some(Duration::from_secs(10)));
             kad_config.set_query_timeout(Duration::from_secs(60));
+
+            let gossipsub_config = gossipsub::ConfigBuilder::default()
+                .heartbeat_interval(Duration::from_secs(10))
+                .validation_mode(ValidationMode::Strict)
+                .message_id_fn(|message| {
+                    let mut hasher = DefaultHasher::new();
+                    message.data.hash(&mut hasher);
+                    message.topic.hash(&mut hasher);
+                    if let Some(peer_id) = message.source {
+                        peer_id.hash(&mut hasher);
+                    }
+                    let now = SystemTime::now()
+                        .duration_since(SystemTime::UNIX_EPOCH)
+                        .unwrap_or_else(|_| std::time::Duration::from_millis(0))
+                        .as_millis();
+                    now.to_string().hash(&mut hasher);
+                    gossipsub::MessageId::from(hasher.finish().to_string())
+                })
+                .build()
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
 
             Ok(ChatBehaviour {
                 ping: ping::Behaviour::new(Config::new().with_interval(Duration::from_secs(10))),
@@ -140,6 +98,12 @@ async fn main() -> anyhow::Result<()> {
                     MemoryStore::new(peer_id),
                     kad_config,
                 ),
+                autonat: autonat::Behaviour::new(key.public().to_peer_id(), autonat::Config::default()),
+                relay_server: relay::Behaviour::new(key.public().to_peer_id(), relay::Config::default()),
+                relay_client,
+                dcutr: dcutr::Behaviour::new(key.public().to_peer_id()),
+                gossipsub: gossipsub::Behaviour::new(MessageAuthenticity::Signed(key.clone()), gossipsub_config)
+                    .map_err(|e| Box::<dyn std::error::Error + Send + Sync>::from(e.to_string()))?
             })
         })?
         .with_swarm_config(|c| {
@@ -167,10 +131,14 @@ async fn main() -> anyhow::Result<()> {
             
             println!("Adding bootstrap peer: {} at {}", peer_id, addr);
             swarm.behaviour_mut().kademlia.add_address(&peer_id, addr);
+            swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
         }
     } else {
         println!("No CHAT_BOOTSTRAP_PEERS environment variable found. Relying on mDNS or manual connections.");
     }
+
+    let chat_topic = gossipsub::IdentTopic::new("chat");
+    swarm.behaviour_mut().gossipsub.subscribe(&chat_topic)?;
 
 
     let mut stdin = BufReader::new(io::stdin()).lines();
@@ -221,6 +189,7 @@ async fn main() -> anyhow::Result<()> {
                             for (peer_id, addr) in new_peers {
                                 println!("mDNS Discovered {peer_id} at {addr}!");
                                 swarm.behaviour_mut().kademlia.add_address(&peer_id, addr.clone());
+                                swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
                                 if let Err(e) = swarm.dial(addr.clone()) {
                                     eprintln!("Error dialing mDNS discovered peer {}: {:?}", peer_id, e);
                                 }
@@ -233,9 +202,18 @@ async fn main() -> anyhow::Result<()> {
                     ChatBehaviourEvent::Identify(event) => match event {
                         identify::Event::Received { connection_id: _, peer_id, info } => {
                             println!("Identify: Received info from {}: {:?}", peer_id, info.agent_version);
+                            let is_relay = info.protocols.iter().any(|protocol| *protocol == relay::HOP_PROTOCOL_NAME);
+
                             for addr in info.listen_addrs {
-                                swarm.behaviour_mut().kademlia.add_address(&peer_id, addr);
+                                swarm.behaviour_mut().kademlia.add_address(&peer_id, addr.clone());
+                                swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
+                                if is_relay {
+                                    let listen_addr = addr.clone().with_p2p(peer_id).unwrap().with(Protocol::P2pCircuit);
+                                    println!("Trying to listen on {:?}", listen_addr);
+                                    swarm.listen_on(listen_addr)?;
+                                }
                             }
+
                         }
                         identify::Event::Sent { connection_id: _, peer_id: _ } => {
                             // println!("Identify: Sent info to {}", peer_id);
@@ -258,6 +236,29 @@ async fn main() -> anyhow::Result<()> {
                         kad::Event::RoutablePeer { .. } => {}
                         kad::Event::PendingRoutablePeer { .. } => {}
                         kad::Event::ModeChanged { .. } => {}
+                    }
+                    ChatBehaviourEvent::Autonat(event) => match event {
+                        autonat::Event::InboundProbe(event) => {
+                            println!("Inbound probe {:?}", event)
+                        }
+                        autonat::Event::OutboundProbe(event) => {
+                            println!("Outbound probe {:?}", event)
+                        }
+                        autonat::Event::StatusChanged{old, new} => {
+                            println!("Status changed from {:?} to {:?}", old, new)
+                        }
+                    }
+                    ChatBehaviourEvent::RelayServer(event) => {
+                        println!("Relay server {:?}", event);
+                    }
+                    ChatBehaviourEvent::RelayClient(event) => {
+                        println!("Relay client {:?}", event);
+                    }
+                    ChatBehaviourEvent::Dcutr(event) => {
+                        println!("Dcutr: {:?}", event);
+                    }
+                    ChatBehaviourEvent::Gossipsub(event) => {
+                        println!("Gossip sub: {:?}", event);
                     }
                 }
                 _ => {}
@@ -293,4 +294,5 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+    
 }
