@@ -1,5 +1,7 @@
+use libp2p::gossipsub::{MessageAuthenticity, ValidationMode};
 use uuid::Uuid;
 use std::collections::HashSet;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use anyhow::anyhow;
 use libp2p::kad::store::MemoryStore;
 use libp2p::kad::Mode;
@@ -9,13 +11,13 @@ use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
 use libp2p::multiaddr::Protocol;
 use libp2p::futures::StreamExt;
 use libp2p::{
-    autonat, dcutr, identify, kad, noise, ping, request_response, relay, tcp, yamux, Multiaddr, PeerId, StreamProtocol
+    autonat, dcutr, gossipsub, identify, kad, noise, ping, request_response, relay, tcp, yamux, Multiaddr, PeerId, StreamProtocol
 };
 use libp2p::mdns;
 use libp2p::request_response::json;
 use serde::{Deserialize, Serialize};
 use std::env;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::{io, select};
 
@@ -42,6 +44,7 @@ struct ChatBehaviour {
     relay_server: relay::Behaviour,
     relay_client: relay::client::Behaviour,
     dcutr: dcutr::Behaviour,
+    gossipsub: gossipsub::Behaviour,
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -52,6 +55,11 @@ enum ChatBehaviourEvent {
     Mdns(mdns::Event),
     Identify(identify::Event),
     Kademlia(kad::Event),
+    Autonat(autonat::Event),
+    RelayServer(relay::Event),
+    RelayClient(relay::client::Event),
+    Dcutr(dcutr::Event),
+    Gossipsub(gossipsub::Event),
 }
 
 impl From<ping::Event> for ChatBehaviourEvent {
@@ -75,6 +83,37 @@ impl From<mdns::Event> for ChatBehaviourEvent {
 impl From<identify::Event> for ChatBehaviourEvent {
     fn from(event: identify::Event) -> Self {
         ChatBehaviourEvent::Identify(event)
+    }
+}
+
+
+impl From<autonat::Event> for ChatBehaviourEvent {
+    fn from(event: autonat::Event) -> Self {
+        ChatBehaviourEvent::Autonat(event)
+    }
+}
+
+impl From<relay::Event> for ChatBehaviourEvent {
+    fn from(event: relay::Event) -> Self {
+        ChatBehaviourEvent::RelayServer(event)
+    }
+}
+
+impl From<relay::client::Event> for ChatBehaviourEvent {
+    fn from(event: relay::client::Event) -> Self {
+        ChatBehaviourEvent::RelayClient(event)
+    }
+}
+
+impl From<dcutr::Event> for ChatBehaviourEvent {
+    fn from(event: dcutr::Event) -> Self {
+        ChatBehaviourEvent::Dcutr(event)
+    }
+}
+
+impl From<gossipsub::Event> for ChatBehaviourEvent {
+    fn from(event: gossipsub::Event) -> Self {
+        ChatBehaviourEvent::Gossipsub(event)
     }
 }
 
@@ -108,7 +147,8 @@ async fn main() -> anyhow::Result<()> {
             let peer_id = key.public().to_peer_id();
 
             let mdns = if mdns_enabled {
-                Toggle::from(Some(mdns::tokio::Behaviour::new(mdns::Config::default(), peer_id)?))
+                Toggle::from(Some(mdns::tokio::Behaviour::new(mdns::Config::default(), peer_id)
+                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?))
             } else {
                 Toggle::from(None)
             };
@@ -116,6 +156,26 @@ async fn main() -> anyhow::Result<()> {
             let mut kad_config = kad::Config::new(StreamProtocol::new("/p2p-chat/1"));
             kad_config.set_periodic_bootstrap_interval(Some(Duration::from_secs(10)));
             kad_config.set_query_timeout(Duration::from_secs(60));
+
+            let gossipsub_config = gossipsub::ConfigBuilder::default()
+                .heartbeat_interval(Duration::from_secs(10))
+                .validation_mode(ValidationMode::Strict)
+                .message_id_fn(|message| {
+                    let mut hasher = DefaultHasher::new();
+                    message.data.hash(&mut hasher);
+                    message.topic.hash(&mut hasher);
+                    if let Some(peer_id) = message.source {
+                        peer_id.hash(&mut hasher);
+                    }
+                    let now = SystemTime::now()
+                        .duration_since(SystemTime::UNIX_EPOCH)
+                        .unwrap_or_else(|_| std::time::Duration::from_millis(0))
+                        .as_millis();
+                    now.to_string().hash(&mut hasher);
+                    gossipsub::MessageId::from(hasher.finish().to_string())
+                })
+                .build()
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
 
             Ok(ChatBehaviour {
                 ping: ping::Behaviour::new(Config::new().with_interval(Duration::from_secs(10))),
@@ -140,6 +200,8 @@ async fn main() -> anyhow::Result<()> {
                 relay_server: relay::Behaviour::new(key.public().to_peer_id(), relay::Config::default()),
                 relay_client,
                 dcutr: dcutr::Behaviour::new(key.public().to_peer_id()),
+                gossipsub: gossipsub::Behaviour::new(MessageAuthenticity::Signed(key.clone()), gossipsub_config)
+                    .map_err(|e| Box::<dyn std::error::Error + Send + Sync>::from(e.to_string()))?
             })
         })?
         .with_swarm_config(|c| {
@@ -167,10 +229,14 @@ async fn main() -> anyhow::Result<()> {
             
             println!("Adding bootstrap peer: {} at {}", peer_id, addr);
             swarm.behaviour_mut().kademlia.add_address(&peer_id, addr);
+            swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
         }
     } else {
         println!("No CHAT_BOOTSTRAP_PEERS environment variable found. Relying on mDNS or manual connections.");
     }
+
+    let chat_topic = gossipsub::IdentTopic::new("chat");
+    swarm.behaviour_mut().gossipsub.subscribe(&chat_topic)?;
 
 
     let mut stdin = BufReader::new(io::stdin()).lines();
@@ -221,6 +287,7 @@ async fn main() -> anyhow::Result<()> {
                             for (peer_id, addr) in new_peers {
                                 println!("mDNS Discovered {peer_id} at {addr}!");
                                 swarm.behaviour_mut().kademlia.add_address(&peer_id, addr.clone());
+                                swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
                                 if let Err(e) = swarm.dial(addr.clone()) {
                                     eprintln!("Error dialing mDNS discovered peer {}: {:?}", peer_id, e);
                                 }
@@ -237,6 +304,7 @@ async fn main() -> anyhow::Result<()> {
 
                             for addr in info.listen_addrs {
                                 swarm.behaviour_mut().kademlia.add_address(&peer_id, addr.clone());
+                                swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
                                 if is_relay {
                                     let listen_addr = addr.clone().with_p2p(peer_id).unwrap().with(Protocol::P2pCircuit);
                                     println!("Trying to listen on {:?}", listen_addr);
@@ -281,11 +349,14 @@ async fn main() -> anyhow::Result<()> {
                     ChatBehaviourEvent::RelayServer(event) => {
                         println!("Relay server {:?}", event);
                     }
-                    ChatBehaviourEvent::RelayCleint(event) => {
-                        println!("Relay server {:?}", event);
+                    ChatBehaviourEvent::RelayClient(event) => {
+                        println!("Relay client {:?}", event);
                     }
                     ChatBehaviourEvent::Dcutr(event) => {
                         println!("Dcutr: {:?}", event);
+                    }
+                    ChatBehaviourEvent::Gossipsub(event) => {
+                        println!("Gossip sub: {:?}", event);
                     }
                 }
                 _ => {}
@@ -321,4 +392,5 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+    
 }
