@@ -1,128 +1,30 @@
-use libp2p::gossipsub::{MessageAuthenticity, ValidationMode};
+mod message;
+mod behaviour;
+
+use crate::behaviour::{ChatBehaviour, ChatBehaviourEvent};
+use crate::message::{MessageRequest, MessageResponse};
+
 use uuid::Uuid;
 use std::collections::HashSet;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use anyhow::anyhow;
-use libp2p::kad::store::MemoryStore;
+use libp2p::swarm::{SwarmEvent};
 use libp2p::kad::Mode;
+use libp2p::kad::store::MemoryStore;
 use libp2p::ping::Config;
-use libp2p::swarm::behaviour::toggle::Toggle;
-use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
-use libp2p::multiaddr::Protocol;
-use libp2p::futures::StreamExt;
 use libp2p::{
     autonat, dcutr, gossipsub, identify, kad, noise, ping, request_response, relay, tcp, yamux, Multiaddr, PeerId, StreamProtocol
 };
-use libp2p::mdns;
+use libp2p::gossipsub::{MessageAuthenticity, ValidationMode};
 use libp2p::request_response::json;
-use serde::{Deserialize, Serialize};
+use libp2p::mdns;
+use libp2p::multiaddr::Protocol;
+use libp2p::futures::StreamExt;
+use libp2p::swarm::behaviour::toggle::Toggle;
 use std::env;
 use std::time::{Duration, SystemTime};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::{io, select};
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct MessageRequest {
-    pub id: Uuid,
-    pub message: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct MessageResponse {
-    pub ack: bool,
-}
-
-#[derive(NetworkBehaviour)]
-#[behaviour(out_event = "ChatBehaviourEvent")]
-struct ChatBehaviour {
-    ping: ping::Behaviour,
-    messaging: json::Behaviour<MessageRequest, MessageResponse>,
-    mdns: Toggle<mdns::tokio::Behaviour>,
-    identify: identify::Behaviour,
-    kademlia: kad::Behaviour<MemoryStore>,
-    autonat: autonat::Behaviour,
-    relay_server: relay::Behaviour,
-    relay_client: relay::client::Behaviour,
-    dcutr: dcutr::Behaviour,
-    gossipsub: gossipsub::Behaviour,
-}
-
-#[allow(clippy::large_enum_variant)]
-#[derive(Debug)]
-enum ChatBehaviourEvent {
-    Ping(ping::Event),
-    Messaging(request_response::Event<MessageRequest, MessageResponse>),
-    Mdns(mdns::Event),
-    Identify(identify::Event),
-    Kademlia(kad::Event),
-    Autonat(autonat::Event),
-    RelayServer(relay::Event),
-    RelayClient(relay::client::Event),
-    Dcutr(dcutr::Event),
-    Gossipsub(gossipsub::Event),
-}
-
-impl From<ping::Event> for ChatBehaviourEvent {
-    fn from(event: ping::Event) -> Self {
-        ChatBehaviourEvent::Ping(event)
-    }
-}
-
-impl From<request_response::Event<MessageRequest, MessageResponse>> for ChatBehaviourEvent {
-    fn from(event: request_response::Event<MessageRequest, MessageResponse>) -> Self {
-        ChatBehaviourEvent::Messaging(event)
-    }
-}
-
-impl From<mdns::Event> for ChatBehaviourEvent {
-    fn from(event: mdns::Event) -> Self {
-        ChatBehaviourEvent::Mdns(event)
-    }
-}
-
-impl From<identify::Event> for ChatBehaviourEvent {
-    fn from(event: identify::Event) -> Self {
-        ChatBehaviourEvent::Identify(event)
-    }
-}
-
-
-impl From<autonat::Event> for ChatBehaviourEvent {
-    fn from(event: autonat::Event) -> Self {
-        ChatBehaviourEvent::Autonat(event)
-    }
-}
-
-impl From<relay::Event> for ChatBehaviourEvent {
-    fn from(event: relay::Event) -> Self {
-        ChatBehaviourEvent::RelayServer(event)
-    }
-}
-
-impl From<relay::client::Event> for ChatBehaviourEvent {
-    fn from(event: relay::client::Event) -> Self {
-        ChatBehaviourEvent::RelayClient(event)
-    }
-}
-
-impl From<dcutr::Event> for ChatBehaviourEvent {
-    fn from(event: dcutr::Event) -> Self {
-        ChatBehaviourEvent::Dcutr(event)
-    }
-}
-
-impl From<gossipsub::Event> for ChatBehaviourEvent {
-    fn from(event: gossipsub::Event) -> Self {
-        ChatBehaviourEvent::Gossipsub(event)
-    }
-}
-
-impl From<kad::Event> for ChatBehaviourEvent {
-    fn from(event: kad::Event) -> Self {
-        ChatBehaviourEvent::Kademlia(event)
-    }
-}
-
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
